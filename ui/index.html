@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>MC反馈查看器</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main id="boot" class="center-screen" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>正在检查登录状态…</p>
+    </main>
+
+    <main id="login-view" class="login-view hidden">
+      <section class="login-card" aria-labelledby="login-title">
+        <div class="app-mark" aria-hidden="true">MC</div>
+        <p class="eyebrow">只读 · 本地 · 轻量</p>
+        <h1 id="login-title">MC反馈查看器</h1>
+        <p class="muted">登录网易开发者账号，查看组件评论与玩家问题反馈。</p>
+
+        <div id="login-notice" class="notice hidden" role="status"></div>
+
+        <form id="password-form" class="form-stack">
+          <label>
+            <span>网易账号</span>
+            <input id="account" name="account" autocomplete="username" maxlength="320" placeholder="邮箱或手机号" required />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" placeholder="仅用于本次登录" required />
+          </label>
+          <button id="password-submit" class="primary-button" type="submit">登录开发者账号</button>
+        </form>
+
+        <details id="cookie-fallback" class="cookie-fallback">
+          <summary>遇到安全验证？使用 Cookie 登录</summary>
+          <form id="cookie-form" class="form-stack compact-form">
+            <label>
+              <span>NTES_SESS</span>
+              <textarea id="cookie" name="cookie" rows="3" maxlength="8192" placeholder="可粘贴完整 Cookie，或仅粘贴 NTES_SESS 的值" required></textarea>
+            </label>
+            <button id="cookie-submit" class="secondary-button" type="submit">验证并登录</button>
+          </form>
+        </details>
+
+        <p class="security-note">密码不会保存；登录态仅写入系统钥匙串。软件不提供任何回复或修改功能。</p>
+      </section>
+    </main>
+
+    <main id="app-view" class="app-view hidden">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">MC</span>
+          <div>
+            <strong>反馈查看器</strong>
+            <small>只读工作台</small>
+          </div>
+        </div>
+        <div class="account-area">
+          <span id="account-summary"></span>
+          <button id="pair-website-button" class="ghost-button" type="button">连接 AI 网站</button>
+          <button id="logout-button" class="ghost-button" type="button">退出登录</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <nav class="sidebar" aria-label="主要功能">
+          <button class="nav-item active" type="button" data-tab="comments">
+            <span class="nav-icon" aria-hidden="true">✦</span>
+            <span>组件评论</span>
+          </button>
+          <button class="nav-item" type="button" data-tab="feedback">
+            <span class="nav-icon" aria-hidden="true">◇</span>
+            <span>玩家反馈</span>
+          </button>
+          <div class="sidebar-foot">
+            <span class="readonly-dot"></span>
+            只读模式
+          </div>
+        </nav>
+
+        <section id="comments-tab" class="tab-page">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">PLAYER VOICE</p>
+              <h2>组件评论</h2>
+            </div>
+            <button class="icon-button" type="button" data-action="refresh-comments" title="刷新评论" aria-label="刷新评论">↻</button>
+          </div>
+
+          <div class="filter-bar">
+            <label class="search-field">
+              <span class="sr-only">搜索评论</span>
+              <input id="comment-keyword" type="search" maxlength="200" placeholder="搜索昵称、内容、组件名…" />
+            </label>
+            <select id="comment-tag" aria-label="组件标签">
+              <option value="">全部标签</option>
+            </select>
+            <label class="date-field">从 <input id="comment-start-date" type="date" /></label>
+            <label class="date-field">至 <input id="comment-end-date" type="date" /></label>
+            <button id="comment-clear" class="ghost-button" type="button">清除</button>
+          </div>
+
+          <div id="comments-master-detail" class="master-detail">
+            <section class="list-panel" aria-label="评论列表">
+              <div id="comments-status" class="list-status"></div>
+              <div id="comments-list" class="item-list"></div>
+              <button id="comments-more" class="load-more hidden" type="button">加载更多</button>
+            </section>
+            <aside id="comment-detail" class="detail-panel" aria-label="评论详情">
+              <div class="detail-empty">
+                <span aria-hidden="true">✦</span>
+                <p>选择一条评论查看详情</p>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="feedback-tab" class="tab-page hidden">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">ISSUE INBOX</p>
+              <h2>玩家反馈</h2>
+            </div>
+            <button class="icon-button" type="button" data-action="refresh-feedback" title="刷新反馈" aria-label="刷新反馈">↻</button>
+          </div>
+
+          <div class="filter-bar">
+            <label class="search-field">
+              <span class="sr-only">搜索反馈</span>
+              <input id="feedback-keyword" type="search" maxlength="200" placeholder="搜索昵称、内容、组件名…" />
+            </label>
+            <select id="feedback-type" aria-label="反馈类型">
+              <option value="">全部类型</option>
+              <option value="0">故障问题</option>
+              <option value="1">玩法建议</option>
+              <option value="2">内容侵权</option>
+              <option value="3">其他</option>
+              <option value="4">组件冲突</option>
+              <option value="5">我的山头</option>
+              <option value="6">性能反馈</option>
+            </select>
+            <select id="feedback-replied" aria-label="回复状态">
+              <option value="">全部状态</option>
+              <option value="false">未回复</option>
+              <option value="true">已回复</option>
+            </select>
+            <button id="feedback-clear" class="ghost-button" type="button">清除</button>
+          </div>
+
+          <div id="feedback-master-detail" class="master-detail">
+            <section class="list-panel" aria-label="反馈列表">
+              <div id="feedback-status" class="list-status"></div>
+              <div id="feedback-list" class="item-list"></div>
+              <button id="feedback-more" class="load-more hidden" type="button">加载更多</button>
+            </section>
+            <aside id="feedback-detail" class="detail-panel" aria-label="反馈详情">
+              <div class="detail-empty">
+                <span aria-hidden="true">◇</span>
+                <p>选择一条反馈查看详情</p>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <div id="pair-dialog" class="dialog-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="pair-title">
+      <form id="pair-form" class="dialog-card form-stack">
+        <div>
+          <p class="eyebrow">本机安全连接</p>
+          <h2 id="pair-title">连接 AI 网站</h2>
+          <p class="muted">先在网站“设置 → 网易开发者账号”生成连接码，再粘贴到这里。登录态会通过 HTTPS 发送给该平台账号，密码不会离开本机。</p>
+        </div>
+        <label>
+          <span>32 位连接码</span>
+          <input id="pair-code" autocomplete="off" maxlength="32" placeholder="粘贴网站生成的连接码" required />
+        </label>
+        <div id="pair-notice" class="notice hidden" role="status"></div>
+        <div class="dialog-actions">
+          <button id="pair-cancel" class="ghost-button" type="button">取消</button>
+          <button id="pair-submit" class="primary-button" type="submit">连接网站</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </body>
+</html>

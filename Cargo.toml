@@ -1,0 +1,10 @@
+[workspace]
+members = ["src-tauri", "web-server"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = "s"

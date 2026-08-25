@@ -1,0 +1,34 @@
+[Unit]
+Description=MC Feedback self-hosted AI workspace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=feedback-ai
+Group=feedback-ai
+WorkingDirectory=/var/lib/mc-feedback-web
+EnvironmentFile=/etc/mc-feedback-web/web.env
+ExecStart=/opt/mc-feedback-web/mc-feedback-web
+Restart=on-failure
+RestartSec=4
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/mc-feedback-web
+ReadWritePaths=/var/lib/mc-feedback-web
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryHigh=160M
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

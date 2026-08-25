@@ -1,0 +1,44 @@
+[package]
+name = "mc-feedback-web"
+version = "0.1.0"
+description = "Lightweight self-hosted AI workspace for MC player feedback"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+argon2 = "0.5.3"
+axum = { version = "0.8.6", features = ["json", "macros"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+cron = "0.15.0"
+csv = "1.4.0"
+docx-rs = "0.4.18"
+ecb = { version = "0.2.1", features = ["alloc"] }
+hex = "0.4.3"
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "hostname", "pool", "rustls-tls", "smtp-transport", "tokio1-rustls-tls"] }
+num-bigint = "0.4.6"
+rand = "0.8.5"
+reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls"] }
+rsa = "0.9.8"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+schemars = "1.2.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+sm4 = "0.6.0"
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting"] }
+tokio = { version = "1.49.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.17", features = ["rt"] }
+url = "2.5.8"
+uuid = { version = "1.20.0", features = ["serde", "v4"] }
+zeroize = "1.8.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+tempfile = "3.23.0"

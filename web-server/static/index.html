@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f6f2">
+  <title>MC 玩家反馈 AI 工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/vendor/markdown-it.min.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="loading" class="boot">正在打开工作台…</div>
+
+  <main id="login" class="login-page hidden" aria-labelledby="login-title">
+    <section class="login-card">
+      <div class="brand-mark">MC</div>
+      <p class="eyebrow">只读 · 安全 · 轻量</p>
+      <h1 id="login-title">玩家反馈 AI 工作台</h1>
+      <p class="muted">登录平台账号，再连接你自己的网易开发者账号，查询评论与反馈。</p>
+      <form id="login-form" class="stack">
+        <label>平台账号邮箱<input id="login-email" name="email" type="email" autocomplete="username" required></label>
+        <label>密码<input id="login-password" name="password" type="password" autocomplete="current-password" required></label>
+        <p id="login-error" class="notice error hidden" role="alert"></p>
+        <button class="primary wide" type="submit">登录</button>
+      </form>
+    </section>
+  </main>
+
+  <div id="workspace" class="workspace hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark small">MC</div>
+        <div><strong>反馈工作台</strong><span>AI 只读分析</span></div>
+      </div>
+      <nav id="nav" aria-label="主导航">
+        <button data-view="query" class="active"><span>◫</span>AI 查询</button>
+        <button data-view="jobs"><span>◷</span>AI 工作</button>
+        <button data-view="runs"><span>✓</span>执行记录</button>
+        <button data-view="files"><span>↓</span>文件</button>
+        <button data-view="settings"><span>⚙</span>设置</button>
+        <button data-view="users" class="admin-only hidden"><span>♙</span>用户管理</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="platform-user" class="platform-user">平台账号：—</div>
+        <div id="developer-pill" class="status-pill">网易账号：检查中</div>
+        <button id="logout" class="text-button">退出平台</button>
+      </div>
+    </aside>
+
+    <header class="mobile-head">
+      <button id="menu-button" class="icon-button" aria-label="打开导航">☰</button>
+      <strong>反馈工作台</strong>
+      <span id="mobile-status" class="dot"></span>
+    </header>
+
+    <section id="view-query" class="view query-view">
+      <aside class="conversation-panel">
+        <div class="panel-head"><h2>AI 查询</h2><button id="new-conversation" class="icon-button" title="新建对话">＋</button></div>
+        <div id="conversation-list" class="conversation-list"></div>
+      </aside>
+      <article class="chat-panel">
+        <div class="chat-head">
+          <div><h1 id="conversation-title">新对话</h1><p id="chat-status" class="muted">可以查询评论、反馈并生成文件</p></div>
+          <button id="delete-conversation" class="secondary danger-text hidden">删除对话</button>
+        </div>
+        <div id="messages" class="messages">
+          <div class="empty-state" id="chat-empty">
+            <div class="empty-icon">✦</div>
+            <h2>想了解玩家在说什么？</h2>
+            <p>用自然语言提问。AI 只能读取评论和问题反馈，不会回复或修改网易数据。</p>
+            <div class="prompt-grid">
+              <button>总结最近的玩家反馈，列出最紧急的三个问题</button>
+              <button>分析全部组件评论的评分和主要意见</button>
+              <button>把未回复的故障问题整理成 Word 报告</button>
+              <button>查询组件冲突反馈并生成 CSV</button>
+            </div>
+          </div>
+        </div>
+        <div id="large-confirm" class="confirm-bar hidden">
+          <span id="large-confirm-text">数据量较大，需要多次模型调用。</span>
+          <button id="large-cancel" class="secondary">取消</button>
+          <button id="large-go" class="primary">确认继续</button>
+        </div>
+        <form id="composer" class="composer">
+          <textarea id="prompt" rows="2" maxlength="20000" placeholder="例如：完整总结最近玩家反馈，并生成 Word 报告"></textarea>
+          <div class="composer-actions">
+            <span class="muted">Enter 发送，Shift + Enter 换行</span>
+            <button id="stop-generation" class="secondary hidden" type="button">停止</button>
+            <button id="send-message" class="primary" type="submit">发送</button>
+          </div>
+        </form>
+      </article>
+    </section>
+
+    <section id="view-jobs" class="view hidden">
+      <div class="page-head">
+        <div><p class="eyebrow">自动执行</p><h1>AI 工作</h1><p class="muted">按固定提示词定时读取数据、生成报告，并可发到固定邮箱。</p></div>
+        <button id="new-job" class="primary">新建工作</button>
+      </div>
+      <div id="jobs-list" class="card-list"></div>
+    </section>
+
+    <section id="view-runs" class="view hidden">
+      <div class="page-head"><div><p class="eyebrow">审计记录</p><h1>执行记录</h1><p class="muted">查看每次后台工作的结果、耗时、工具和邮件状态。</p></div><button id="refresh-runs" class="secondary">刷新</button></div>
+      <div id="runs-list" class="table-card"></div>
+    </section>
+
+    <section id="view-files" class="view hidden">
+      <div class="page-head"><div><p class="eyebrow">私有下载</p><h1>文件</h1><p class="muted">生成的 CSV、Word 和 Markdown 文件将在 30 天后自动删除。</p></div><button id="refresh-files" class="secondary">刷新</button></div>
+      <div id="files-list" class="table-card"></div>
+    </section>
+
+    <section id="view-settings" class="view hidden">
+      <div class="page-head"><div><p class="eyebrow">连接与安全</p><h1>设置</h1><p class="muted">密钥和 Cookie 均加密保存，不会显示在网页中。</p></div></div>
+      <div class="settings-grid">
+        <form id="developer-form" class="settings-card">
+          <div class="section-title"><h2>网易开发者账号</h2><span id="developer-state" class="badge neutral">检查中</span></div>
+          <p id="developer-summary" class="muted">正在读取账号状态…</p>
+          <div id="developer-login-fields" class="stack">
+            <label>账号<input id="developer-account" autocomplete="username" placeholder="邮箱或手机号"></label>
+            <label>密码<input id="developer-password" type="password" autocomplete="current-password" placeholder="仅本次登录使用"></label>
+            <button class="primary" type="submit">密码登录</button>
+            <details id="local-pairing">
+              <summary>云服务器触发安全验证：改用本机安全连接</summary>
+              <p class="muted compact-note">网易可能拒绝云服务器 IP 的密码登录。本机程序会在你的电脑上登录，再用一次性连接码把会话交给当前平台账号；密码不会上传到本站。</p>
+              <div class="button-row pairing-actions">
+                <a class="artifact-link" href="/downloads/mc-feedback-viewer-windows-x64.exe">下载 Windows 本机程序</a>
+                <button id="create-pairing" class="secondary" type="button">生成连接码</button>
+              </div>
+              <div id="pairing-result" class="stack hidden">
+                <label>一次性连接码<input id="pairing-code" readonly autocomplete="off"></label>
+                <div class="button-row pairing-actions">
+                  <span id="pairing-status" class="muted compact-note">10 分钟内有效</span>
+                  <button id="copy-pairing" class="secondary" type="button">复制连接码</button>
+                </div>
+              </div>
+            </details>
+            <details>
+              <summary>遇到安全验证：改用 Cookie 登录</summary>
+              <label>NTES_SESS<input id="developer-cookie" type="password" autocomplete="off" placeholder="粘贴 NTES_SESS 或完整 Cookie"></label>
+              <button id="cookie-login" class="secondary" type="button">Cookie 登录</button>
+            </details>
+          </div>
+          <button id="developer-logout" class="secondary danger-text hidden" type="button">退出网易账号</button>
+        </form>
+
+        <form id="model-form" class="settings-card admin-only hidden">
+          <div class="section-title"><h2>AI 模型</h2><span id="model-state" class="badge neutral">未测试</span></div>
+          <label>Base URL<input id="model-base-url" type="url" required placeholder="https://example.com/v1"></label>
+          <label>模型名称<input id="model-name" required placeholder="gpt-5.6-sol"></label>
+          <label>API Key<input id="model-key" type="password" autocomplete="off" placeholder="留空则保留现有密钥"></label>
+          <div class="button-row"><button class="primary" type="submit">保存</button><button id="test-model" class="secondary" type="button">保存并测试</button></div>
+        </form>
+
+        <form id="smtp-form" class="settings-card wide-card admin-only hidden" autocomplete="off" data-form-type="other">
+          <div class="section-title"><h2>发信设置</h2><span id="smtp-state" class="badge neutral">未测试</span></div>
+          <div class="form-grid">
+            <label>常用预设<select id="smtp-preset"><option value="">自定义</option><option value="163">163 邮箱</option><option value="qq">QQ 邮箱</option></select></label>
+            <label>SMTP 服务器<input id="smtp-host" required></label>
+            <label>端口<input id="smtp-port" type="number" min="1" max="65535" required></label>
+            <label>连接加密<select id="smtp-security"><option value="smtps">SMTPS</option><option value="starttls">STARTTLS</option></select></label>
+            <label>邮箱账号<input id="smtp-username" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore></label>
+            <label>SMTP 授权码<input id="smtp-password" type="password" autocomplete="new-password" data-lpignore="true" data-1p-ignore placeholder="留空则保留现有授权码"></label>
+            <label>发件地址<input id="smtp-from-email" type="email" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+            <label>发件名称<input id="smtp-from-name" value="MC 玩家反馈助手"></label>
+          </div>
+          <p class="field-help">QQ、163 邮箱请填写完整邮箱地址和邮箱设置中生成的 SMTP 授权码，不要填写网站登录密码或邮箱网页登录密码。</p>
+          <div class="test-row"><label>测试收件地址<input id="smtp-test-recipient" type="email" autocomplete="off" autocapitalize="none" spellcheck="false"></label><button id="test-smtp" class="secondary" type="button">保存并发送测试邮件</button><button class="primary" type="submit">保存</button></div>
+        </form>
+      </div>
+    </section>
+
+    <section id="view-users" class="view hidden">
+      <div class="page-head"><div><p class="eyebrow">平台管理</p><h1>用户管理</h1><p class="muted">创建平台登录账号。每位用户需自行登录网易开发者账号，评论、反馈、对话、文件和任务彼此隔离。</p></div><button id="refresh-users" class="secondary">刷新</button></div>
+      <div class="user-admin-grid">
+        <form id="user-form" class="settings-card">
+          <div class="section-title"><h2>新建平台账号</h2><span class="badge neutral">普通用户</span></div>
+          <label>登录邮箱<input id="user-email" type="email" autocomplete="off" required placeholder="user@example.com"></label>
+          <label>初始密码
+            <input id="user-password" type="password" autocomplete="new-password" minlength="12" required placeholder="至少 12 个字符" spellcheck="false" data-lpignore="true" data-1p-ignore>
+          </label>
+          <div class="password-tools">
+            <button id="generate-user-password" class="secondary" type="button">生成强密码</button>
+            <button id="copy-user-password" class="secondary" type="button">复制密码</button>
+          </div>
+          <p class="field-help">随机密码为 20 位，包含大小写字母、数字和符号。创建后请立即安全地交给用户；平台不会再次显示或保存明文密码。</p>
+          <button class="primary" type="submit">创建账号</button>
+        </form>
+        <div id="users-list" class="table-card"></div>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="job-dialog">
+    <form id="job-form" method="dialog" class="dialog-form">
+      <div class="dialog-head"><div><p class="eyebrow">定时执行</p><h2 id="job-dialog-title">新建 AI 工作</h2></div><button id="close-job" class="icon-button" type="button">×</button></div>
+      <input id="job-id" type="hidden">
+      <label>工作名称<input id="job-name" maxlength="100" required placeholder="例如：每周反馈总结"></label>
+      <label>提示词<textarea id="job-prompt" rows="6" maxlength="20000" required placeholder="明确说明要查询的数据、分析目标和是否生成文件或发送邮件"></textarea></label>
+      <fieldset><legend>允许读取的数据</legend><label class="check"><input id="tool-comments" type="checkbox" value="list_player_comments" checked>组件评论</label><label class="check"><input id="tool-feedback" type="checkbox" value="list_player_feedback" checked>玩家反馈</label><label class="check"><input id="tool-account" type="checkbox" value="get_account_status">账号状态</label></fieldset>
+      <fieldset><legend>自动生成文件</legend><label class="check"><input id="format-csv" type="checkbox" value="csv">CSV 原始数据</label><label class="check"><input id="format-docx" type="checkbox" value="docx">Word 报告</label><label class="check"><input id="format-md" type="checkbox" value="md">Markdown</label></fieldset>
+      <div class="form-grid">
+        <label>运行周期<select id="schedule-type"><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option><option value="cron">高级 Cron</option></select></label>
+        <label id="schedule-day-wrap" class="hidden">日期/星期<select id="schedule-day"></select></label>
+        <label id="schedule-time-wrap">运行时间<input id="schedule-time" type="time" value="09:00"></label>
+        <label id="schedule-cron-wrap" class="hidden">五段 Cron<input id="schedule-cron" placeholder="0 9 * * 1"></label>
+        <label>时区<input id="job-timezone" value="Asia/Shanghai" required></label>
+      </div>
+      <div class="schedule-preview"><strong>未来五次：</strong><span id="schedule-preview">填写时间后自动预览</span></div>
+      <label>固定收件地址（可选）<input id="job-email" type="email" placeholder="AI 只能发送到此地址，每次最多一封"></label>
+      <label class="switch"><input id="job-enabled" type="checkbox" checked><span></span>启用此工作</label>
+      <p id="job-error" class="notice error hidden"></p>
+      <div class="dialog-actions"><button id="cancel-job" class="secondary" type="button">取消</button><button class="primary" type="submit">保存工作</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MC反馈查看器",
+  "version": "0.1.3",
+  "identifier": "com.mcfeedback.viewer",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'none'; object-src 'none'; frame-src 'none'"
+    },
+    "windows": [
+      {
+        "title": "MC反馈查看器",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 560,
+        "center": true,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "只读查看网易 Minecraft 开发者平台的玩家评论与问题反馈",
+    "longDescription": "轻量、只读的玩家评论与问题反馈查看器，并提供本机 stdio MCP 服务。"
+  }
+}
