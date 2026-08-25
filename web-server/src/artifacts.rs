@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use docx_rs::{Docx, Paragraph, Run};
 use uuid::Uuid;
 
@@ -106,6 +106,12 @@ pub async fn create_csv(
         .join(format!("{}.csv", Uuid::new_v4()));
     let file = csv_file(&path)?;
     let mut writer = csv::WriterBuilder::new().from_writer(file);
+    let time_range = DatasetTimeRange::from_query(&dataset.query)?;
+    let useful_only = dataset
+        .query
+        .get("useful_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     if dataset.kind == "comments" {
         writer.write_record([
             "评论ID",
@@ -121,12 +127,24 @@ pub async fn create_csv(
         let mut query: CommentQuery = serde_json::from_value(dataset.query.clone())?;
         query.offset = 0;
         query.limit = 100;
+        // AI range reports enforce dates locally because the remote comment
+        // date filter is intermittent and feedback has no date filter at all.
+        query.start_date = None;
+        query.end_date = None;
         loop {
             let page = service
                 .list_comments(query.clone())
                 .await
                 .map_err(|error| anyhow::anyhow!(error.message))?;
+            let before_start = time_range
+                .page_is_before_start(page.items.iter().map(|item| item.published_at.as_str()));
             for item in page.items {
+                if !time_range.contains(&item.published_at) {
+                    continue;
+                }
+                if useful_only && !comment_is_useful_candidate(&item.content, &item.tag) {
+                    continue;
+                }
                 writer.write_record([
                     item.id,
                     item.resource_id,
@@ -139,7 +157,7 @@ pub async fn create_csv(
                     item.published_at,
                 ])?;
             }
-            if !page.has_more {
+            if before_start || !page.has_more {
                 break;
             }
             query.offset = query.offset.saturating_add(query.limit);
@@ -165,7 +183,12 @@ pub async fn create_csv(
                 .list_feedback(query.clone())
                 .await
                 .map_err(|error| anyhow::anyhow!(error.message))?;
+            let before_start = time_range
+                .page_is_before_start(page.items.iter().map(|item| item.created_at.as_str()));
             for item in page.items {
+                if !time_range.contains(&item.created_at) {
+                    continue;
+                }
                 writer.write_record([
                     item.id,
                     item.resource_id,
@@ -179,7 +202,7 @@ pub async fn create_csv(
                     item.forbid_reply.to_string(),
                 ])?;
             }
-            if !page.has_more {
+            if before_start || !page.has_more {
                 break;
             }
             query.offset = query.offset.saturating_add(query.limit);
@@ -188,6 +211,134 @@ pub async fn create_csv(
     writer.flush()?;
     drop(writer);
     database.add_artifact(owner_id, conversation_id, run_id, "csv", &filename, &path)
+}
+
+fn comment_is_useful_candidate(content: &str, tag: &str) -> bool {
+    let content = content.trim().to_lowercase();
+    if content.is_empty() {
+        return false;
+    }
+    let compact: String = content
+        .chars()
+        .filter(|value| value.is_alphanumeric())
+        .collect();
+    if matches!(
+        compact.as_str(),
+        "好玩"
+            | "不好玩"
+            | "很好玩"
+            | "非常好玩"
+            | "不错"
+            | "很好"
+            | "一般"
+            | "垃圾"
+            | "666"
+            | "牛逼"
+            | "支持"
+            | "加油"
+    ) {
+        return false;
+    }
+    if content.chars().count() >= 24 {
+        return true;
+    }
+    let signals = [
+        "问题",
+        "建议",
+        "希望",
+        "能不能",
+        "可以加",
+        "请加",
+        "增加",
+        "添加",
+        "优化",
+        "修复",
+        "改进",
+        "不能",
+        "无法",
+        "用不了",
+        "打不开",
+        "进不去",
+        "不生效",
+        "失效",
+        "报错",
+        "错误",
+        "bug",
+        "崩溃",
+        "闪退",
+        "卡顿",
+        "掉帧",
+        "延迟",
+        "冲突",
+        "兼容",
+        "丢失",
+        "消失",
+        "缺少",
+        "不支持",
+        "版本",
+    ];
+    let tag = tag.to_lowercase();
+    signals
+        .iter()
+        .any(|signal| content.contains(signal) || tag.contains(signal))
+}
+
+#[derive(Clone, Copy, Default)]
+struct DatasetTimeRange {
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+}
+
+impl DatasetTimeRange {
+    fn from_query(query: &serde_json::Value) -> Result<Self> {
+        Ok(Self {
+            start: parse_dataset_time(query.get("start_date"), false)?,
+            end: parse_dataset_time(query.get("end_date"), true)?,
+        })
+    }
+
+    fn contains(self, value: &str) -> bool {
+        let Ok(value) = DateTime::parse_from_rfc3339(value) else {
+            return true;
+        };
+        let value = value.with_timezone(&Utc);
+        self.start.is_none_or(|start| value >= start) && self.end.is_none_or(|end| value <= end)
+    }
+
+    fn page_is_before_start<'a>(self, values: impl Iterator<Item = &'a str>) -> bool {
+        let Some(start) = self.start else {
+            return false;
+        };
+        values
+            .filter_map(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .max()
+            .is_some_and(|newest| newest < start)
+    }
+}
+
+fn parse_dataset_time(
+    value: Option<&serde_json::Value>,
+    end_of_day: bool,
+) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(value.with_timezone(&Utc)));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let time = if end_of_day {
+            date.and_hms_opt(23, 59, 59)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        };
+        return Ok(time.map(|value| value.and_utc()));
+    }
+    bail!("数据集日期范围无效")
 }
 
 fn csv_file(path: &std::path::Path) -> Result<File> {
@@ -255,6 +406,18 @@ mod tests {
         assert!(content.contains("匹配 12 条"));
         assert!(content.contains("匿名化"));
         assert!(content.contains("崩溃"));
+    }
+
+    #[test]
+    fn dataset_time_range_uses_inclusive_boundaries() {
+        let range = DatasetTimeRange::from_query(&serde_json::json!({
+            "start_date":"2026-08-24T12:00:00+08:00",
+            "end_date":"2026-08-25T12:00:00+08:00"
+        }))
+        .unwrap();
+        assert!(range.contains("2026-08-24T04:00:00Z"));
+        assert!(range.contains("2026-08-25T04:00:00Z"));
+        assert!(!range.contains("2026-08-25T04:00:01Z"));
     }
 
     #[test]
