@@ -543,8 +543,14 @@ async function waitForBackgroundChat(runId, conversationId, assistantCountBefore
       }
       const run = await api("/api/chat/runs/" + encodeURIComponent(runId));
       if (!run.active) {
-        const error = new Error("后台会话已结束，但没有生成结果");
+        if (run.state === "done") {
+          el("chat-status").textContent = "后台分析已完成，正在读取结果…";
+          await new Promise(function (resolve) { window.setTimeout(resolve, 200); });
+          continue;
+        }
+        const error = new Error(run.message || "后台会话已结束，但没有生成结果");
         error.status = 409;
+        error.code = run.code || "AI_ERROR";
         throw error;
       }
       el("chat-status").textContent = "已重连后台会话，正在继续运行…";

@@ -373,6 +373,13 @@ impl AiEngine {
                 .await
             {
                 Ok(assistant) => assistant,
+                Err(error)
+                    if !outcome.fallback_sections.is_empty()
+                        && !error.to_string().starts_with("CANCELLED:") =>
+                {
+                    eprintln!("model finalization failed; preserving completed summaries");
+                    return self.finish_from_summaries(history, &context, outcome);
+                }
                 Err(error) => return Err(error),
             };
             let tool_calls = assistant
@@ -389,6 +396,10 @@ impl AiEngine {
                     .trim()
                     .to_string();
                 if outcome.text.is_empty() {
+                    if !outcome.fallback_sections.is_empty() {
+                        eprintln!("model returned an empty final answer; preserving summaries");
+                        return self.finish_from_summaries(history, &context, outcome);
+                    }
                     bail!("模型没有返回最终回答");
                 }
                 return Ok(outcome);
@@ -429,6 +440,41 @@ impl AiEngine {
                 }
             }
         }
+    }
+
+    fn finish_from_summaries(
+        &self,
+        history: &[Message],
+        context: &AiContext,
+        mut outcome: AiOutcome,
+    ) -> Result<AiOutcome> {
+        let report = format!(
+            "# 玩家反馈分析（自动恢复结果）\n\n> 上游模型未完成最终整理。以下内容来自已经完成的数据读取和分批摘要，可继续人工整理。\n\n{}",
+            outcome.fallback_sections.join("\n\n")
+        );
+        outcome.text = report.clone();
+        if outcome.artifacts.is_empty() && wants_markdown_report(history) {
+            let datasets: Vec<_> = outcome
+                .dataset_ids
+                .iter()
+                .filter_map(|id| self.database.dataset(&context.user_id, id).ok().flatten())
+                .collect();
+            let content = artifacts::report_content(&report, &datasets);
+            if let Ok(artifact) = artifacts::create_markdown(
+                &self.database,
+                &context.user_id,
+                context.conversation_id.as_deref(),
+                context.run_id.as_deref(),
+                "玩家反馈分析-自动恢复",
+                &content,
+            ) {
+                outcome.tool_summary.push("生成 Markdown 恢复报告".into());
+                outcome.artifacts.push(artifact);
+            } else {
+                eprintln!("failed to create fallback Markdown artifact");
+            }
+        }
+        Ok(outcome)
     }
 
     async fn call_tool(
@@ -1230,6 +1276,9 @@ async fn retry_model_delay(cancel: &CancellationToken, failures: u32) -> Result<
 fn model_error_can_fallback(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_lowercase();
     message.contains("模型服务在")
+        || message.contains("模型摘要为空")
+        || message.contains("模型没有返回 message")
+        || message.contains("模型返回了无法识别的数据")
         || message.contains("timed out")
         || message.contains("timeout")
         || message.contains("connection reset")
@@ -1330,6 +1379,20 @@ fn compact_data_tool_messages(messages: &mut [Value]) {
                 json!("{\"compacted\":true,\"message\":\"原始数据已用于生成报告\"}");
         }
     }
+}
+
+fn wants_markdown_report(history: &[Message]) -> bool {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.to_lowercase())
+        .is_some_and(|prompt| {
+            prompt.contains("markdown")
+                || prompt.contains("md文件")
+                || prompt.contains(".md")
+                || prompt.contains("生成md")
+        })
 }
 
 pub fn save_model_settings(database: &Database, input: &ModelInput) -> Result<ModelView> {
@@ -1565,9 +1628,36 @@ mod tests {
         assert!(model_error_can_fallback(&anyhow::anyhow!(
             "502:bad gateway"
         )));
+        assert!(model_error_can_fallback(&anyhow::anyhow!("模型摘要为空")));
         assert!(!model_error_can_fallback(&anyhow::anyhow!(
             "401:invalid api key"
         )));
+    }
+
+    #[test]
+    fn markdown_recovery_uses_only_the_latest_user_request() {
+        let history = vec![
+            Message {
+                id: "1".into(),
+                conversation_id: "c".into(),
+                role: "user".into(),
+                content: "生成 Markdown".into(),
+                tool_summary: None,
+                created_at: 0,
+            },
+            Message {
+                id: "2".into(),
+                conversation_id: "c".into(),
+                role: "user".into(),
+                content: "只要网页回答".into(),
+                tool_summary: None,
+                created_at: 1,
+            },
+        ];
+        assert!(!wants_markdown_report(&history));
+        let mut latest = history;
+        latest[1].content = "请生成md文件".into();
+        assert!(wants_markdown_report(&latest));
     }
 
     #[test]

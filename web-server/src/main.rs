@@ -62,10 +62,21 @@ struct AppState {
     ai: AiEngine,
     scheduler: Scheduler,
     active_runs: Arc<Mutex<HashMap<String, (String, CancellationToken)>>>,
+    completed_runs: Arc<Mutex<HashMap<String, CompletedChatRun>>>,
     interactive: Arc<Semaphore>,
     developer_logins: Arc<Semaphore>,
     developer_pairings: Arc<Mutex<HashMap<String, DeveloperPairing>>>,
     login_attempts: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+#[derive(Clone)]
+struct CompletedChatRun {
+    owner_id: String,
+    state: &'static str,
+    code: Option<String>,
+    message: Option<String>,
+    total: Option<usize>,
+    completed_at: Instant,
 }
 
 #[derive(Clone)]
@@ -200,6 +211,7 @@ async fn main() -> Result<()> {
         ai,
         scheduler: scheduler.clone(),
         active_runs: Arc::new(Mutex::new(HashMap::new())),
+        completed_runs: Arc::new(Mutex::new(HashMap::new())),
         interactive: Arc::new(Semaphore::new(1)),
         developer_logins: Arc::new(Semaphore::new(1)),
         developer_pairings: Arc::new(Mutex::new(HashMap::new())),
@@ -961,10 +973,16 @@ async fn send_message(
         }
         runs.insert(input.run_id.clone(), (owner_id.clone(), cancel.clone()));
     }
+    state
+        .completed_runs
+        .lock()
+        .map_err(ApiError::internal)?
+        .remove(&input.run_id);
     let (sender, receiver) = mpsc::channel(16);
     let run_id = input.run_id.clone();
     let task_state = state.clone();
     tokio::spawn(async move {
+        let run_started = Instant::now();
         let _ = send_event(
             &sender,
             "status",
@@ -1028,39 +1046,103 @@ async fn send_message(
         .await;
         progress_stop.cancel();
         let _ = progress_task.await;
-        match result {
+        let completed = match result {
             Ok(outcome) => {
                 let summary = serde_json::to_string(&outcome.tool_summary).unwrap_or_default();
-                let _ = task_state.database.add_message(
+                if let Err(error) = task_state.database.add_message(
                     &owner_id,
                     &conversation_id,
                     "assistant",
                     &outcome.text,
                     Some(&summary),
-                );
-                let _ = send_event(
-                    &sender,
-                    "tool",
-                    json!({"items":outcome.tool_summary,"dataset_ids":outcome.dataset_ids}),
-                )
-                .await;
-                for artifact in outcome.artifacts {
-                    let _ = send_event(
+                ) {
+                    let message = redact(&error.to_string());
+                    eprintln!(
+                        "chat run {} failed to persist result after {}s: {}",
+                        &run_id[..run_id.len().min(8)],
+                        run_started.elapsed().as_secs(),
+                        message
+                    );
+                    send_event(
                         &sender,
-                        "artifact",
-                        serde_json::to_value(artifact).unwrap_or_default(),
+                        "error",
+                        json!({"code":"INTERNAL_ERROR","message":message,"run_id":run_id}),
                     )
                     .await;
+                    CompletedChatRun {
+                        owner_id: owner_id.clone(),
+                        state: "error",
+                        code: Some("INTERNAL_ERROR".into()),
+                        message: Some(message),
+                        total: None,
+                        completed_at: Instant::now(),
+                    }
+                } else {
+                    let tool_count = outcome.tool_count;
+                    let _ = send_event(
+                        &sender,
+                        "tool",
+                        json!({"items":outcome.tool_summary,"dataset_ids":outcome.dataset_ids}),
+                    )
+                    .await;
+                    for artifact in outcome.artifacts {
+                        let _ = send_event(
+                            &sender,
+                            "artifact",
+                            serde_json::to_value(artifact).unwrap_or_default(),
+                        )
+                        .await;
+                    }
+                    let _ = send_event(&sender, "text", json!({"content":outcome.text})).await;
+                    let _ = send_event(&sender, "done", json!({"run_id":run_id})).await;
+                    eprintln!(
+                        "chat run {} completed after {}s with {} tools",
+                        &run_id[..run_id.len().min(8)],
+                        run_started.elapsed().as_secs(),
+                        tool_count
+                    );
+                    CompletedChatRun {
+                        owner_id: owner_id.clone(),
+                        state: "done",
+                        code: None,
+                        message: None,
+                        total: None,
+                        completed_at: Instant::now(),
+                    }
                 }
-                let _ = send_event(&sender, "text", json!({"content":outcome.text})).await;
-                let _ = send_event(&sender, "done", json!({"run_id":run_id})).await;
             }
             Err(error) => {
                 let message = redact(&error.to_string());
                 let (code, total) = large_error(&message);
-                let _=send_event(&sender,"error",json!({"code":code,"message":if code=="LARGE_CONFIRMATION_REQUIRED"{"匹配数据较多，确认后将分批分析全部记录"}else{&message},"total":total,"run_id":run_id})).await;
+                let public_message = if code == "LARGE_CONFIRMATION_REQUIRED" {
+                    "匹配数据较多，确认后将分批分析全部记录".to_string()
+                } else {
+                    message.clone()
+                };
+                eprintln!(
+                    "chat run {} failed after {}s: {}:{}",
+                    &run_id[..run_id.len().min(8)],
+                    run_started.elapsed().as_secs(),
+                    code,
+                    message
+                );
+                let _ = send_event(
+                    &sender,
+                    "error",
+                    json!({"code":code,"message":public_message,"total":total,"run_id":run_id}),
+                )
+                .await;
+                CompletedChatRun {
+                    owner_id: owner_id.clone(),
+                    state: "error",
+                    code: Some(code.into()),
+                    message: Some(public_message),
+                    total,
+                    completed_at: Instant::now(),
+                }
             }
-        }
+        };
+        remember_completed_run(&task_state, run_id.clone(), completed);
         let _ = task_state.active_runs.lock().map(|mut values| {
             if values
                 .get(&run_id)
@@ -1087,6 +1169,25 @@ async fn send_event(
         .unwrap_or_else(|_| Event::default().event("error").data("{}"));
     let _ = sender.send(Ok(event)).await;
 }
+
+fn remember_completed_run(state: &AppState, run_id: String, completed: CompletedChatRun) {
+    let Ok(mut values) = state.completed_runs.lock() else {
+        return;
+    };
+    values.retain(|_, value| value.completed_at.elapsed() < Duration::from_secs(24 * 60 * 60));
+    while values.len() >= 100 {
+        let Some(oldest) = values
+            .iter()
+            .min_by_key(|(_, value)| value.completed_at)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        values.remove(&oldest);
+    }
+    values.insert(run_id, completed);
+}
+
 async fn cancel_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1117,7 +1218,26 @@ async fn chat_run_status(
         .map_err(ApiError::internal)?
         .get(&id)
         .is_some_and(|(owner_id, _)| owner_id == &session.admin.id);
-    Ok(Json(json!({"active":active})))
+    if active {
+        return Ok(Json(json!({"active":true,"state":"running"})));
+    }
+    let completed = state
+        .completed_runs
+        .lock()
+        .map_err(ApiError::internal)?
+        .get(&id)
+        .filter(|value| value.owner_id == session.admin.id)
+        .cloned();
+    Ok(Json(match completed {
+        Some(value) => json!({
+            "active":false,
+            "state":value.state,
+            "code":value.code,
+            "message":value.message,
+            "total":value.total
+        }),
+        None => json!({"active":false,"state":"unknown"}),
+    }))
 }
 
 async fn list_artifacts(
