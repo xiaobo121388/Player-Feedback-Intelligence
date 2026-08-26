@@ -970,6 +970,32 @@ async fn send_message(
             json!({"run_id":run_id,"message":"正在等待分析…"}),
         )
         .await;
+        let progress_stop = CancellationToken::new();
+        let progress_task = {
+            let sender = sender.clone();
+            let run_id = run_id.clone();
+            let stop = progress_stop.clone();
+            tokio::spawn(async move {
+                let mut elapsed = 0u64;
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            elapsed += 30;
+                            send_event(
+                                &sender,
+                                "status",
+                                json!({
+                                    "run_id": run_id,
+                                    "message": format!("正在分批归纳并生成报告…已用时 {} 分 {} 秒", elapsed / 60, elapsed % 60)
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            })
+        };
         let result = async {
             let _permit = task_state
                 .interactive
@@ -999,6 +1025,8 @@ async fn send_message(
                 .await
         }
         .await;
+        progress_stop.cancel();
+        let _ = progress_task.await;
         match result {
             Ok(outcome) => {
                 let summary = serde_json::to_string(&outcome.tool_summary).unwrap_or_default();

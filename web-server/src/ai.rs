@@ -33,6 +33,9 @@ AI 工作是定时或手动运行的后台任务。只读取完成报告所需�
 用户要求下载文件时，先查询数据，再调用对应 create_* 工具；不要伪造下载链接。"#;
 const SUMMARY_MAX_ITEMS: usize = 60;
 const SUMMARY_MAX_CHARS: usize = 8_000;
+const SUMMARY_CONCURRENCY: usize = 4;
+const SUMMARY_STAGE_TIMEOUT: Duration = Duration::from_secs(75);
+const REDUCTION_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TimeRange {
@@ -319,7 +322,7 @@ impl AiEngine {
             let content = message.content.to_lowercase();
             content.contains("markdown") || content.contains("md文件") || content.contains(".md")
         });
-        let request_timeout = if scheduled {
+        let initial_request_timeout = if scheduled {
             Duration::from_secs(10 * 60)
         } else {
             Duration::from_secs(3 * 60)
@@ -364,6 +367,17 @@ impl AiEngine {
             if cancel.is_cancelled() {
                 bail!("CANCELLED:生成已停止");
             }
+            // Once a complete data tool has produced a local fallback section,
+            // later model turns are formatting/tool-selection work. Keep those
+            // turns bounded so an unreliable compatible endpoint cannot hold an
+            // interactive report open for many minutes per retry.
+            let request_timeout = if outcome.fallback_sections.is_empty() {
+                initial_request_timeout
+            } else if scheduled {
+                Duration::from_secs(90)
+            } else {
+                Duration::from_secs(60)
+            };
             let assistant = match self
                 .request_message_with_limits(
                     &config,
@@ -938,39 +952,71 @@ impl AiEngine {
             batches.push(buffer);
         }
 
-        let mut pending = batches.into_iter();
-        let mut tasks = JoinSet::new();
-        let mut summaries = Vec::new();
-        loop {
-            while tasks.len() < 2 {
-                let Some(batch) = pending.next() else {
+        let fallback_summaries: Vec<_> = batches
+            .iter()
+            .map(|batch| fallback_batch_summary(kind, batch))
+            .collect();
+        let work = async {
+            let mut pending = batches.into_iter();
+            let mut tasks = JoinSet::new();
+            let mut summaries = Vec::new();
+            loop {
+                while tasks.len() < SUMMARY_CONCURRENCY {
+                    let Some(batch) = pending.next() else {
+                        break;
+                    };
+                    let engine = self.clone();
+                    let config = config.clone();
+                    let kind = kind.to_string();
+                    let cancel = cancel.clone();
+                    tasks.spawn(async move {
+                        let fallback = fallback_batch_summary(&kind, &batch);
+                        match engine
+                            .summarize_batch(&config, &kind, &batch, &cancel)
+                            .await
+                        {
+                            Ok(summary) => Ok(summary),
+                            Err(error) if model_error_can_fallback(&error) => Ok(fallback),
+                            Err(error) => Err(error),
+                        }
+                    });
+                }
+                let Some(result) = tasks.join_next().await else {
                     break;
                 };
-                let engine = self.clone();
-                let config = config.clone();
-                let kind = kind.to_string();
-                let cancel = cancel.clone();
-                tasks.spawn(async move {
-                    let fallback = fallback_batch_summary(&kind, &batch);
-                    match engine
-                        .summarize_batch(&config, &kind, &batch, &cancel)
-                        .await
-                    {
-                        Ok(summary) => Ok(summary),
-                        Err(error) if model_error_can_fallback(&error) => Ok(fallback),
-                        Err(error) => Err(error),
-                    }
-                });
+                summaries.push(result.context("模型分批摘要任务异常")??);
             }
-            let Some(result) = tasks.join_next().await else {
-                break;
-            };
-            summaries.push(result.context("模型分批摘要任务异常")??);
+            Ok(summaries)
+        };
+        match tokio::time::timeout(SUMMARY_STAGE_TIMEOUT, work).await {
+            Ok(result) => result,
+            Err(_) => Ok(fallback_summaries),
         }
-        Ok(summaries)
     }
 
     async fn reduce_summaries(
+        &self,
+        config: &ModelConfig,
+        kind: &str,
+        summaries: Vec<String>,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        if summaries.is_empty() {
+            return Ok("没有数据".into());
+        }
+        let fallback = fallback_reduce_group(kind, &summaries);
+        match tokio::time::timeout(
+            REDUCTION_STAGE_TIMEOUT,
+            self.reduce_summaries_unbounded(config, kind, summaries, cancel),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(fallback),
+        }
+    }
+
+    async fn reduce_summaries_unbounded(
         &self,
         config: &ModelConfig,
         kind: &str,
