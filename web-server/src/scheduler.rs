@@ -13,8 +13,6 @@ use crate::{
     db::{Database, Job},
 };
 
-const JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
 #[derive(Clone)]
 pub struct Scheduler {
     database: Database,
@@ -108,13 +106,7 @@ impl Scheduler {
         };
         let result: Result<crate::ai::AiOutcome> = async {
             let cancel = CancellationToken::new();
-            let mut outcome =
-                tokio::time::timeout(JOB_TIMEOUT, self.ai.run(&history, context, cancel.clone()))
-                    .await
-                    .map_err(|_| {
-                        cancel.cancel();
-                        anyhow::anyhow!("任务超过 15 分钟仍未完成，已自动停止")
-                    })??;
+            let mut outcome = self.ai.run(&history, context, cancel).await?;
             let datasets: Vec<_> = outcome
                 .dataset_ids
                 .iter()

@@ -34,8 +34,6 @@ AI 工作是定时或手动运行的后台任务。只读取完成报告所需�
 const SUMMARY_MAX_ITEMS: usize = 60;
 const SUMMARY_MAX_CHARS: usize = 8_000;
 const SUMMARY_CONCURRENCY: usize = 4;
-const SUMMARY_STAGE_TIMEOUT: Duration = Duration::from_secs(75);
-const REDUCTION_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TimeRange {
@@ -318,11 +316,7 @@ impl AiEngine {
         let service = self.service_for_user(&context.user_id)?;
         let config = self.config()?;
         let scheduled = context.run_id.is_some();
-        let wants_markdown = history.iter().any(|message| {
-            let content = message.content.to_lowercase();
-            content.contains("markdown") || content.contains("md文件") || content.contains(".md")
-        });
-        let initial_request_timeout = if scheduled {
+        let request_timeout = if scheduled {
             Duration::from_secs(10 * 60)
         } else {
             Duration::from_secs(3 * 60)
@@ -363,21 +357,10 @@ impl AiEngine {
             fallback_sections: Vec::new(),
         };
 
-        for _ in 0..12 {
+        loop {
             if cancel.is_cancelled() {
                 bail!("CANCELLED:生成已停止");
             }
-            // Once a complete data tool has produced a local fallback section,
-            // later model turns are formatting/tool-selection work. Keep those
-            // turns bounded so an unreliable compatible endpoint cannot hold an
-            // interactive report open for many minutes per retry.
-            let request_timeout = if outcome.fallback_sections.is_empty() {
-                initial_request_timeout
-            } else if scheduled {
-                Duration::from_secs(90)
-            } else {
-                Duration::from_secs(60)
-            };
             let assistant = match self
                 .request_message_with_limits(
                     &config,
@@ -390,42 +373,6 @@ impl AiEngine {
                 .await
             {
                 Ok(assistant) => assistant,
-                Err(error)
-                    if !outcome.fallback_sections.is_empty()
-                        && model_error_can_fallback(&error) =>
-                {
-                    outcome.text = format!(
-                        "模型最终排版超时，以下为已完成的数据归纳结果。请优先复核标有“需人工复核”的批次。\n\n{}",
-                        outcome.fallback_sections.join("\n\n")
-                    );
-                    outcome
-                        .tool_summary
-                        .push("模型最终排版超时，已生成降级报告".into());
-                    if wants_markdown
-                        && !outcome
-                            .artifacts
-                            .iter()
-                            .any(|artifact| artifact.kind == "md")
-                    {
-                        let datasets: Vec<_> = outcome
-                            .dataset_ids
-                            .iter()
-                            .filter_map(|id| {
-                                self.database.dataset(&context.user_id, id).ok().flatten()
-                            })
-                            .collect();
-                        let report = artifacts::report_content(&outcome.text, &datasets);
-                        outcome.artifacts.push(artifacts::create_markdown(
-                            &self.database,
-                            &context.user_id,
-                            context.conversation_id.as_deref(),
-                            context.run_id.as_deref(),
-                            "玩家反馈优先级报告-降级版",
-                            &report,
-                        )?);
-                    }
-                    return Ok(outcome);
-                }
                 Err(error) => return Err(error),
             };
             let tool_calls = assistant
@@ -447,9 +394,6 @@ impl AiEngine {
                 return Ok(outcome);
             }
             for call in tool_calls {
-                if outcome.tool_count >= 40 {
-                    bail!("AI 工具调用次数超过限制");
-                }
                 let id = call.get("id").and_then(Value::as_str).unwrap_or("tool");
                 let function = call.get("function").context("工具调用缺少 function")?;
                 let name = function
@@ -463,7 +407,7 @@ impl AiEngine {
                         .unwrap_or("{}"),
                 )
                 .context("工具参数不是有效 JSON")?;
-                outcome.tool_count += 1;
+                outcome.tool_count = outcome.tool_count.saturating_add(1);
                 if let Some(run_id) = context.run_id.as_deref() {
                     self.database
                         .update_run_progress(run_id, outcome.tool_count)?;
@@ -485,7 +429,6 @@ impl AiEngine {
                 }
             }
         }
-        bail!("AI 在限定轮次内没有完成回答")
     }
 
     async fn call_tool(
@@ -952,10 +895,6 @@ impl AiEngine {
             batches.push(buffer);
         }
 
-        let fallback_summaries: Vec<_> = batches
-            .iter()
-            .map(|batch| fallback_batch_summary(kind, batch))
-            .collect();
         let work = async {
             let mut pending = batches.into_iter();
             let mut tasks = JoinSet::new();
@@ -988,10 +927,7 @@ impl AiEngine {
             }
             Ok(summaries)
         };
-        match tokio::time::timeout(SUMMARY_STAGE_TIMEOUT, work).await {
-            Ok(result) => result,
-            Err(_) => Ok(fallback_summaries),
-        }
+        work.await
     }
 
     async fn reduce_summaries(
@@ -1001,19 +937,8 @@ impl AiEngine {
         summaries: Vec<String>,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        if summaries.is_empty() {
-            return Ok("没有数据".into());
-        }
-        let fallback = fallback_reduce_group(kind, &summaries);
-        match tokio::time::timeout(
-            REDUCTION_STAGE_TIMEOUT,
-            self.reduce_summaries_unbounded(config, kind, summaries, cancel),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Ok(fallback),
-        }
+        self.reduce_summaries_unbounded(config, kind, summaries, cancel)
+            .await
     }
 
     async fn reduce_summaries_unbounded(
@@ -1117,13 +1042,14 @@ impl AiEngine {
         tools: &[Value],
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        self.request_message_with_limits(
+        self.request_message_with_retry_policy(
             config,
             messages,
             tools,
             cancel,
             Duration::from_secs(3 * 60),
             4_096,
+            false,
         )
         .await
     }
@@ -1137,13 +1063,36 @@ impl AiEngine {
         request_timeout: Duration,
         max_completion_tokens: usize,
     ) -> Result<Value> {
+        self.request_message_with_retry_policy(
+            config,
+            messages,
+            tools,
+            cancel,
+            request_timeout,
+            max_completion_tokens,
+            true,
+        )
+        .await
+    }
+
+    async fn request_message_with_retry_policy(
+        &self,
+        config: &ModelConfig,
+        messages: &[Value],
+        tools: &[Value],
+        cancel: &CancellationToken,
+        request_timeout: Duration,
+        max_completion_tokens: usize,
+        retry_forever: bool,
+    ) -> Result<Value> {
         ensure_public_endpoint(&config.api_root).await?;
         let mut payload = json!({"model":config.model,"messages":messages,"stream":false,"max_completion_tokens":max_completion_tokens});
         if !tools.is_empty() {
             payload["tools"] = Value::Array(tools.to_vec());
             payload["tool_choice"] = json!("auto");
         }
-        for attempt in 0..2 {
+        let mut failures = 0u32;
+        loop {
             let request = self
                 .client
                 .post(format!("{}/chat/completions", config.api_root))
@@ -1157,8 +1106,11 @@ impl AiEngine {
             };
             let response = match response {
                 Ok(response) => response,
-                Err(error) if attempt == 0 && (error.is_timeout() || error.is_connect()) => {
-                    retry_model_delay(cancel).await?;
+                Err(error)
+                    if should_retry_model_error(&error) && (retry_forever || failures == 0) =>
+                {
+                    retry_model_delay(cancel, failures).await?;
+                    failures = failures.saturating_add(1);
                     continue;
                 }
                 Err(error) if error.is_timeout() => {
@@ -1167,19 +1119,23 @@ impl AiEngine {
                 Err(error) => return Err(error.into()),
             };
             let status = response.status();
+            if should_retry_model_status(status) && (retry_forever || failures == 0) {
+                retry_model_delay(cancel, failures).await?;
+                failures = failures.saturating_add(1);
+                continue;
+            }
             let body: Value = match response.json().await {
                 Ok(body) => body,
-                Err(error) if attempt == 0 && error.is_timeout() => {
-                    retry_model_delay(cancel).await?;
+                Err(error)
+                    if should_retry_model_error(&error) && (retry_forever || failures == 0) =>
+                {
+                    retry_model_delay(cancel, failures).await?;
+                    failures = failures.saturating_add(1);
                     continue;
                 }
                 Err(error) => return Err(error).context("模型返回了无法识别的数据"),
             };
             if !status.is_success() {
-                if attempt == 0 && should_retry_model_status(status) {
-                    retry_model_delay(cancel).await?;
-                    continue;
-                }
                 let code = body
                     .pointer("/error/code")
                     .and_then(Value::as_str)
@@ -1195,7 +1151,6 @@ impl AiEngine {
                 .cloned()
                 .context("模型没有返回 message");
         }
-        unreachable!("模型请求重试循环必须返回")
     }
 
     fn config(&self) -> Result<ModelConfig> {
@@ -1221,14 +1176,33 @@ impl AiEngine {
 fn should_retry_model_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
     )
 }
 
-async fn retry_model_delay(cancel: &CancellationToken) -> Result<()> {
+fn should_retry_model_error(error: &reqwest::Error) -> bool {
+    if error.is_timeout() || error.is_connect() || error.is_body() {
+        return true;
+    }
+    let message = error.to_string().to_lowercase();
+    message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("unexpected eof")
+        || message.contains("eof while")
+        || message.contains("broken pipe")
+}
+
+fn retry_delay_seconds(failures: u32) -> u64 {
+    (1u64 << failures.min(5)).min(30)
+}
+
+async fn retry_model_delay(cancel: &CancellationToken, failures: u32) -> Result<()> {
     tokio::select! {
         _ = cancel.cancelled() => bail!("CANCELLED:生成已停止"),
-        _ = tokio::time::sleep(Duration::from_secs(1)) => Ok(()),
+        _ = tokio::time::sleep(Duration::from_secs(retry_delay_seconds(failures))) => Ok(()),
     }
 }
 
@@ -1488,11 +1462,21 @@ mod tests {
 
     #[test]
     fn model_retry_is_limited_to_transient_server_errors() {
+        assert!(should_retry_model_status(StatusCode::REQUEST_TIMEOUT));
         assert!(should_retry_model_status(StatusCode::BAD_GATEWAY));
         assert!(should_retry_model_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(should_retry_model_status(StatusCode::GATEWAY_TIMEOUT));
         assert!(!should_retry_model_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(!should_retry_model_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        assert_eq!(retry_delay_seconds(0), 1);
+        assert_eq!(retry_delay_seconds(1), 2);
+        assert_eq!(retry_delay_seconds(4), 16);
+        assert_eq!(retry_delay_seconds(5), 30);
+        assert_eq!(retry_delay_seconds(100), 30);
     }
 
     #[test]

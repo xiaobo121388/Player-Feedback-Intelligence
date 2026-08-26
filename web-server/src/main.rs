@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
             "/api/conversations/{id}/messages",
             get(list_messages).post(send_message),
         )
+        .route("/api/chat/runs/{id}", get(chat_run_status))
         .route("/api/chat/runs/{id}/cancel", post(cancel_run))
         .route("/api/artifacts", get(list_artifacts))
         .route("/api/artifacts/export", post(export_artifact))
@@ -987,7 +988,7 @@ async fn send_message(
                                 "status",
                                 json!({
                                     "run_id": run_id,
-                                    "message": format!("正在分批归纳并生成报告…已用时 {} 分 {} 秒", elapsed / 60, elapsed % 60)
+                                    "message": format!("正在分批归纳并生成报告…已用时 {} 分 {} 秒；无总时长上限，断线会自动重连", elapsed / 60, elapsed % 60)
                                 }),
                             )
                             .await;
@@ -1102,6 +1103,21 @@ async fn cancel_run(
         }
     }
     Ok(Json(json!({"ok":true})))
+}
+
+async fn chat_run_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = authorize(&state, &headers, false)?;
+    let active = state
+        .active_runs
+        .lock()
+        .map_err(ApiError::internal)?
+        .get(&id)
+        .is_some_and(|(owner_id, _)| owner_id == &session.admin.id);
+    Ok(Json(json!({"active":active})))
 }
 
 async fn list_artifacts(

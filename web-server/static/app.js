@@ -442,6 +442,7 @@ async function sendChat(content, allowLarge, resume) {
     renderMessages();
     el("prompt").value = "";
   }
+  const assistantCountBefore = state.messages.filter(function (message) { return message.role === "assistant"; }).length;
   const runId = crypto.randomUUID();
   const abortController = new AbortController();
   state.activeRun = runId;
@@ -459,12 +460,27 @@ async function sendChat(content, allowLarge, resume) {
     });
     if (!response.ok) {
       const body = await response.json().catch(function () { return {}; });
-      throw new Error((body.error && body.error.message) || body.message || "无法开始分析");
+      const error = new Error((body.error && body.error.message) || body.message || "无法开始分析");
+      error.status = response.status;
+      throw error;
     }
-    await consumeSse(response);
+    const terminal = await consumeSse(response);
+    if (!terminal.done && !terminal.error) {
+      await waitForBackgroundChat(runId, state.currentConversation.id, assistantCountBefore, abortController.signal);
+    }
   } catch (error) {
     if (error.name === "AbortError") {
       el("chat-status").textContent = "已停止";
+    } else if (!error.status) {
+      try {
+        await waitForBackgroundChat(runId, state.currentConversation.id, assistantCountBefore, abortController.signal);
+      } catch (reconnectError) {
+        if (reconnectError.name === "AbortError") el("chat-status").textContent = "已停止";
+        else {
+          toast(reconnectError.message, true);
+          el("chat-status").textContent = "分析失败";
+        }
+      }
     } else {
       toast(error.message, true);
       el("chat-status").textContent = "分析失败";
@@ -483,6 +499,7 @@ async function consumeSse(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const terminal = { done: false, error: false };
   while (true) {
     const value = await reader.read();
     if (value.done) break;
@@ -497,8 +514,45 @@ async function consumeSse(response) {
         if (line.startsWith("event:")) eventName = line.slice(6).trim();
         if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
       });
-      if (data.length) handleSseEvent(eventName, JSON.parse(data.join("\n")));
+      if (data.length) {
+        handleSseEvent(eventName, JSON.parse(data.join("\n")));
+        if (eventName === "done") terminal.done = true;
+        if (eventName === "error") terminal.error = true;
+      }
     }
+  }
+  return terminal;
+}
+
+async function waitForBackgroundChat(runId, conversationId, assistantCountBefore, signal) {
+  el("chat-status").textContent = "页面连接中断，正在重连后台会话…";
+  while (true) {
+    if (signal.aborted) throw new DOMException("已停止", "AbortError");
+    try {
+      const result = await api("/api/conversations/" + encodeURIComponent(conversationId) + "/messages");
+      const messages = result.items || [];
+      const assistantCount = messages.filter(function (message) { return message.role === "assistant"; }).length;
+      if (assistantCount > assistantCountBefore) {
+        state.messages = messages;
+        state.datasets = result.datasets || [];
+        renderMessages();
+        state.pendingPrompt = null;
+        el("chat-status").textContent = "分析完成";
+        await loadConversations(conversationId);
+        return;
+      }
+      const run = await api("/api/chat/runs/" + encodeURIComponent(runId));
+      if (!run.active) {
+        const error = new Error("后台会话已结束，但没有生成结果");
+        error.status = 409;
+        throw error;
+      }
+      el("chat-status").textContent = "已重连后台会话，正在继续运行…";
+    } catch (error) {
+      if (error.status) throw error;
+      el("chat-status").textContent = "网络仍未恢复，将继续尝试重连…";
+    }
+    await new Promise(function (resolve) { window.setTimeout(resolve, 5000); });
   }
 }
 
