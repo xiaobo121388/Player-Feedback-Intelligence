@@ -149,7 +149,7 @@ npx -y @tauri-apps/cli@latest build --bundles nsis
 
 - API 客户端只定义网易登录端点和 `GET /users/me`、`GET /items/comment/pe/`、`GET /items/feedback/pe/`。
 - 项目没有评论回复、反馈回复、提交反馈、网易数据删除、遥测、自动更新或云端 MCP 功能。Web 导出只生成当前登录用户可下载的私有报告文件。
-- 前端只调用本站 API；Markdown 渲染禁用原始 HTML 和图片，并仅允许 HTTP/HTTPS 外部链接，避免把反馈内容当作可执行页面内容。
+- 前端只调用本站 API；Markdown 渲染禁用原始 HTML 和图片，外部链接仅允许 HTTP/HTTPS，并额外允许报告内受限的 `#source-f...` / `#source-c...` 原文索引。
 - 外部浏览器入口只允许打开 `163.com` 与 `netease.com` 域名下的 HTTP/HTTPS 链接。
 - 明确收到 `no_login` 才清除会话；普通网络故障不会误删钥匙串内容。
 - 日志不得记录密码、Cookie、Cookie 请求头或完整登录请求体。

@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write, sync::Arc};
+use std::{collections::HashSet, fs::File, io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -11,14 +11,21 @@ use crate::{
 };
 
 pub fn report_content(summary: &str, datasets: &[DatasetSpec]) -> String {
-    let mut output = format!(
-        "生成时间：{}\n隐私说明：报告默认匿名化玩家昵称和 UID；原始数据仅在 CSV 导出中保留。\n\n",
-        Utc::now().to_rfc3339()
+    let summary = summary.trim();
+    let (heading, body) = split_leading_h1(summary);
+    let mut output = String::new();
+    if let Some(heading) = heading {
+        output.push_str(heading);
+        output.push_str("\n\n");
+    }
+    output.push_str(&format!("> 生成时间：{}\n", Utc::now().to_rfc3339()));
+    output.push_str(
+        "> 隐私说明：报告默认匿名化玩家身份，仅保留完成分析所需的正文，不包含玩家 UID。\n",
     );
     if datasets.is_empty() {
-        output.push_str("数据范围：本次回答没有可关联的数据集。\n\n");
+        output.push_str("> 数据范围：本次回答没有可关联的数据集。\n\n");
     } else {
-        output.push_str("数据范围与统计：\n");
+        output.push_str("> 数据范围与统计：\n");
         for dataset in datasets {
             let label = if dataset.kind == "comments" {
                 "组件评论"
@@ -26,15 +33,17 @@ pub fn report_content(summary: &str, datasets: &[DatasetSpec]) -> String {
                 "玩家反馈"
             };
             output.push_str(&format!(
-                "- {label}：匹配 {} 条；筛选条件 {}\n",
+                "> - {label}：匹配 {} 条；筛选条件 {}\n",
                 dataset.total,
                 serde_json::to_string(&dataset.query).unwrap_or_else(|_| "{}".into())
             ));
         }
         output.push('\n');
     }
-    output.push_str("分析总结：\n");
-    output.push_str(summary.trim());
+    if heading.is_none() {
+        output.push_str("## 分析总结\n\n");
+    }
+    output.push_str(body.trim());
     output
 }
 
@@ -50,8 +59,198 @@ pub fn create_markdown(
     let path = database
         .artifact_root
         .join(format!("{}.md", Uuid::new_v4()));
-    std::fs::write(&path, format!("# {}\n\n{}\n", title.trim(), content.trim()))?;
+    std::fs::write(&path, finalize_markdown(title, content))?;
     database.add_artifact(owner_id, conversation_id, run_id, "md", &filename, &path)
+}
+
+fn split_leading_h1(content: &str) -> (Option<&str>, &str) {
+    let content = content.trim();
+    let first = content.lines().next().unwrap_or_default().trim_end();
+    if first.starts_with("# ") {
+        let body = content
+            .get(first.len()..)
+            .unwrap_or_default()
+            .trim_start_matches(['\r', '\n']);
+        (Some(first), body)
+    } else {
+        (None, content)
+    }
+}
+
+fn finalize_markdown(title: &str, content: &str) -> String {
+    let content = repair_source_indexes(content);
+    let content = content.trim();
+    let mut output = if split_leading_h1(content).0.is_some() {
+        content.to_string()
+    } else {
+        format!("# {}\n\n{}", title.trim(), content)
+    };
+    output.push('\n');
+    output
+}
+
+fn repair_source_indexes(content: &str) -> String {
+    let mut lines: Vec<String> = content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let Some(appendix) = lines.iter().position(|line| {
+        let line = line.trim();
+        line.starts_with("## ") && line.contains("附录")
+    }) else {
+        return lines.join("\n");
+    };
+
+    let mut definitions = Vec::new();
+    let mut definition_set = HashSet::new();
+    for line in &lines[appendix + 1..] {
+        if let Some(id) = source_heading_id(line)
+            && definition_set.insert(id.clone())
+        {
+            definitions.push(id);
+        }
+    }
+    if definitions.is_empty() {
+        return lines.join("\n");
+    }
+
+    let mut referenced = HashSet::new();
+    let mut dangling = Vec::new();
+    for line in &mut lines[..appendix] {
+        let (repaired, targets, missing) = repair_source_links(line, &definition_set);
+        *line = repaired;
+        referenced.extend(targets);
+        dangling.extend(missing);
+    }
+    let unreferenced: Vec<_> = definitions
+        .into_iter()
+        .filter(|id| !referenced.contains(id))
+        .collect();
+    if unreferenced.is_empty() && dangling.is_empty() {
+        return lines.join("\n");
+    }
+
+    let insertion = lines[..appendix]
+        .iter()
+        .rposition(|line| {
+            let line = line.trim();
+            line.starts_with("## ") && line.contains("问题与功能建议")
+        })
+        .and_then(|section| {
+            lines[section + 1..appendix]
+                .iter()
+                .position(|line| line.trim().starts_with("## "))
+                .map(|offset| section + 1 + offset)
+        })
+        .unwrap_or(appendix);
+    let mut notice = vec![
+        String::new(),
+        "### 待复核｜索引完整性补充".to_string(),
+        String::new(),
+    ];
+    if !unreferenced.is_empty() {
+        notice.push(
+            "以下原文已保留在附录中，但未被模型归入上方具体问题或建议，请人工复核。".to_string(),
+        );
+        notice.push(String::new());
+        notice.push(format!(
+            "原文索引：{}",
+            unreferenced
+                .iter()
+                .map(|id| format!("[{}](#{id})", source_label(id)))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    dangling.sort();
+    dangling.dedup();
+    if !dangling.is_empty() {
+        if !unreferenced.is_empty() {
+            notice.push(String::new());
+        }
+        notice.push(format!(
+            "> 索引校验发现附录缺少 {}；为避免错误跳转，已移除这些失效链接。",
+            dangling
+                .iter()
+                .map(|id| source_label(id))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    notice.push(String::new());
+    lines.splice(insertion..insertion, notice);
+    lines.join("\n")
+}
+
+fn source_heading_id(line: &str) -> Option<String> {
+    let value = line
+        .trim()
+        .strip_prefix("### ")?
+        .split_whitespace()
+        .next()?;
+    normalize_source_id(value)
+}
+
+fn normalize_source_id(value: &str) -> Option<String> {
+    let value = value.trim().trim_start_matches('#').to_ascii_lowercase();
+    let digits = value
+        .strip_prefix("source-f")
+        .or_else(|| value.strip_prefix("source-c"))?;
+    if digits.is_empty() || !digits.bytes().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    Some(value)
+}
+
+fn source_label(id: &str) -> String {
+    id.strip_prefix("source-")
+        .unwrap_or(id)
+        .to_ascii_uppercase()
+}
+
+fn repair_source_links(
+    line: &str,
+    definitions: &HashSet<String>,
+) -> (String, Vec<String>, Vec<String>) {
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0usize;
+    let mut referenced = Vec::new();
+    let mut dangling = Vec::new();
+    while let Some(label_end_offset) = line[cursor..].find("](#") {
+        let label_end = cursor + label_end_offset;
+        let Some(label_start_offset) = line[cursor..label_end].rfind('[') else {
+            output.push_str(&line[cursor..label_end + 3]);
+            cursor = label_end + 3;
+            continue;
+        };
+        let start = cursor + label_start_offset;
+        let target_start = label_end + 3;
+        let Some(target_end_offset) = line[target_start..].find(')') else {
+            output.push_str(&line[cursor..]);
+            cursor = line.len();
+            break;
+        };
+        let target_end = target_start + target_end_offset;
+        let Some(id) = normalize_source_id(&line[target_start..target_end]) else {
+            output.push_str(&line[cursor..target_end + 1]);
+            cursor = target_end + 1;
+            continue;
+        };
+        output.push_str(&line[cursor..start]);
+        if definitions.contains(&id) {
+            output.push_str(&line[start..target_end + 1]);
+            referenced.push(id);
+        } else {
+            output.push_str(&line[start + 1..label_end]);
+            output.push_str("（附录缺失）");
+            dangling.push(id);
+        }
+        cursor = target_end + 1;
+    }
+    output.push_str(&line[cursor..]);
+    (output, referenced, dangling)
 }
 
 pub fn create_docx(
@@ -371,6 +570,64 @@ mod tests {
     }
 
     #[test]
+    fn markdown_keeps_one_model_heading_and_repairs_source_indexes() {
+        let document = finalize_markdown(
+            "外层文件标题",
+            r#"# 玩家反馈优先级日报
+
+## 三、问题与功能建议
+
+### P1｜示例问题
+
+原文索引：[F001](#source-f001)、[F999](#source-f999)
+
+## 四、建议处理顺序
+
+## 五、附录：有用评论与反馈原文
+
+### source-f001
+
+> 第一条原文
+
+### source-f002
+
+> 第二条原文"#,
+        );
+
+        assert!(document.starts_with("# 玩家反馈优先级日报\n"));
+        assert_eq!(
+            document
+                .lines()
+                .filter(|line| line.starts_with("# "))
+                .count(),
+            1
+        );
+        assert!(document.contains("[F002](#source-f002)"));
+        assert!(document.contains("F999（附录缺失）"));
+        assert!(!document.contains("](#source-f999)"));
+        assert!(
+            document.find("### 待复核｜索引完整性补充").unwrap()
+                < document.find("## 四、建议处理顺序").unwrap()
+        );
+    }
+
+    #[test]
+    fn source_index_repair_leaves_complete_reports_unchanged() {
+        let content = r#"# 日报
+
+## 三、问题与功能建议
+
+原文索引：[C001](#source-c001)
+
+## 五、附录
+
+### source-c001
+
+> 原文"#;
+        assert_eq!(repair_source_indexes(content), content);
+    }
+
+    #[test]
     fn docx_is_a_valid_zip_container() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("key"), [5u8; 32]).unwrap();
@@ -406,6 +663,20 @@ mod tests {
         assert!(content.contains("匹配 12 条"));
         assert!(content.contains("匿名化"));
         assert!(content.contains("崩溃"));
+    }
+
+    #[test]
+    fn report_scope_stays_below_the_model_heading() {
+        let content = report_content("# 玩家反馈优先级日报\n\n## 一、执行摘要\n\n摘要", &[]);
+        assert!(content.starts_with("# 玩家反馈优先级日报\n\n> 生成时间："));
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| line.starts_with("# "))
+                .count(),
+            1
+        );
+        assert!(content.contains("## 一、执行摘要"));
     }
 
     #[test]

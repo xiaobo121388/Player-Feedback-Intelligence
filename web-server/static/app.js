@@ -24,17 +24,32 @@ const markdownRenderer = window.markdownit ? window.markdownit({
 
 if (markdownRenderer) {
   markdownRenderer.validateLink = function (url) {
-    return /^https?:\/\//i.test(String(url || "").trim());
+    const value = String(url || "").trim();
+    return /^https?:\/\//i.test(value) || /^#source-[fc]\d+$/i.test(value);
   };
   markdownRenderer.renderer.rules.image = function (tokens, index) {
     return markdownRenderer.utils.escapeHtml(tokens[index].content || "");
+  };
+  const defaultHeadingOpen = markdownRenderer.renderer.rules.heading_open || function (tokens, index, options, environment, renderer) {
+    return renderer.renderToken(tokens, index, options);
+  };
+  markdownRenderer.renderer.rules.heading_open = function (tokens, index, options, environment, renderer) {
+    const inline = tokens[index + 1];
+    const heading = inline && inline.type === "inline" ? String(inline.content || "").trim().toLowerCase() : "";
+    if (tokens[index].tag === "h3" && /^source-[fc]\d+$/.test(heading)) {
+      tokens[index].attrSet("id", heading);
+    }
+    return defaultHeadingOpen(tokens, index, options, environment, renderer);
   };
   const defaultLinkOpen = markdownRenderer.renderer.rules.link_open || function (tokens, index, options, environment, renderer) {
     return renderer.renderToken(tokens, index, options);
   };
   markdownRenderer.renderer.rules.link_open = function (tokens, index, options, environment, renderer) {
-    tokens[index].attrSet("target", "_blank");
-    tokens[index].attrSet("rel", "noopener noreferrer");
+    const href = tokens[index].attrGet("href") || "";
+    if (!href.startsWith("#")) {
+      tokens[index].attrSet("target", "_blank");
+      tokens[index].attrSet("rel", "noopener noreferrer");
+    }
     return defaultLinkOpen(tokens, index, options, environment, renderer);
   };
 }
