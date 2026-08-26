@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::Duration,
@@ -881,6 +881,7 @@ impl AiEngine {
         let mut buffer = Vec::new();
         let mut chars = 0usize;
         for value in items {
+            let value = summary_input_record(&value);
             let length = value.to_string().chars().count();
             if !buffer.is_empty()
                 && (buffer.len() >= SUMMARY_MAX_ITEMS || chars + length > SUMMARY_MAX_CHARS)
@@ -909,25 +910,55 @@ impl AiEngine {
                     let kind = kind.to_string();
                     let cancel = cancel.clone();
                     tasks.spawn(async move {
-                        let fallback = fallback_batch_summary(&kind, &batch);
-                        match engine
-                            .summarize_batch(&config, &kind, &batch, &cancel)
+                        engine
+                            .summarize_batch_adaptive(&config, &kind, batch, &cancel)
                             .await
-                        {
-                            Ok(summary) => Ok(summary),
-                            Err(error) if model_error_can_fallback(&error) => Ok(fallback),
-                            Err(error) => Err(error),
-                        }
                     });
                 }
                 let Some(result) = tasks.join_next().await else {
                     break;
                 };
-                summaries.push(result.context("模型分批摘要任务异常")??);
+                summaries.extend(result.context("模型分批摘要任务异常")??);
             }
             Ok(summaries)
         };
         work.await
+    }
+
+    async fn summarize_batch_adaptive(
+        &self,
+        config: &ModelConfig,
+        kind: &str,
+        items: Vec<Value>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>> {
+        let mut pending = VecDeque::from([items]);
+        let mut summaries = Vec::new();
+        while let Some(batch) = pending.pop_front() {
+            match self.summarize_batch(config, kind, &batch, cancel).await {
+                Ok(summary) => summaries.push(summary),
+                Err(error) if model_error_can_fallback(&error) && batch.len() > 1 => {
+                    let right = batch.len() / 2;
+                    let mut left_batch = batch;
+                    let right_batch = left_batch.split_off(right);
+                    eprintln!(
+                        "model summary batch interrupted; split {} records into {} and {}",
+                        left_batch.len() + right_batch.len(),
+                        left_batch.len(),
+                        right_batch.len()
+                    );
+                    pending.push_front(right_batch);
+                    pending.push_front(left_batch);
+                }
+                Err(error) if model_error_can_fallback(&error) => {
+                    eprintln!("single-record model summary interrupted; reconnecting");
+                    retry_model_delay(cancel, 5).await?;
+                    pending.push_front(batch);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(summaries)
     }
 
     async fn reduce_summaries(
@@ -1016,7 +1047,7 @@ impl AiEngine {
         cancel: &CancellationToken,
     ) -> Result<String> {
         let message = self
-            .request_message_with_limits(
+            .request_message_with_retry_policy(
                 config,
                 &[
                     json!({"role":"system","content":system}),
@@ -1026,6 +1057,7 @@ impl AiEngine {
                 cancel,
                 Duration::from_secs(90),
                 2_048,
+                false,
             )
             .await?;
         message
@@ -1213,35 +1245,41 @@ fn model_error_can_fallback(error: &anyhow::Error) -> bool {
         || message.contains("timeout")
         || message.contains("connection reset")
         || message.contains("connection closed")
+        || message.starts_with("408:")
         || message.starts_with("502:")
         || message.starts_with("503:")
         || message.starts_with("504:")
 }
 
-fn fallback_batch_summary(kind: &str, items: &[Value]) -> String {
-    let useful_records: Vec<_> = items.iter().take(20).map(compact_record).collect();
-    json!({
-        "themes":[{"theme":"模型批次摘要超时，需人工复核","count":items.len()}],
-        "severity":"unknown",
-        "representative_ids":useful_records.iter().filter_map(|item|item.get("id")).cloned().collect::<Vec<_>>(),
-        "useful_records":useful_records,
-        "risks":[format!("{kind}批次未完成模型归纳")],
-        "suggestions":["根据保留的候选原文进行人工复核"],
-        "limitations":["上游模型超时，使用本地降级摘要"]
-    })
-    .to_string()
-}
-
-fn compact_record(value: &Value) -> Value {
+fn summary_input_record(value: &Value) -> Value {
     let content = value
         .get("content")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .chars()
+        .take(1_500)
+        .collect::<String>();
+    let reply = value
+        .get("developer_reply")
+        .and_then(|reply| {
+            reply
+                .as_str()
+                .or_else(|| reply.get("content").and_then(Value::as_str))
+        })
+        .unwrap_or_default()
+        .chars()
+        .take(1_000)
+        .collect::<String>();
     json!({
         "id":value.get("id").cloned().unwrap_or(Value::Null),
+        "resource_id":value.get("resource_id").cloned().unwrap_or(Value::Null),
         "resource_name":value.get("resource_name").cloned().unwrap_or(Value::Null),
         "time":value.get("published_at").or_else(||value.get("created_at")).cloned().unwrap_or(Value::Null),
-        "content":content.chars().take(500).collect::<String>()
+        "feedback_type":value.get("feedback_type_label").or_else(||value.get("feedback_type")).cloned().unwrap_or(Value::Null),
+        "tag":value.get("tag").cloned().unwrap_or(Value::Null),
+        "stars":value.get("stars").cloned().unwrap_or(Value::Null),
+        "content":content,
+        "developer_reply":reply,
     })
 }
 
@@ -1480,21 +1518,42 @@ mod tests {
     }
 
     #[test]
-    fn model_timeout_has_a_bounded_local_fallback() {
+    fn summary_input_drops_large_unneeded_fields_and_bounds_text() {
+        let record = json!({
+            "id":"f1",
+            "resource_name":"组件",
+            "created_at":"2026-08-26T00:00:00Z",
+            "feedback_type_label":"功能建议",
+            "content":"问".repeat(3_000),
+            "developer_reply":{"content":"答".repeat(2_000)},
+            "images":["https://example.test/very-large-image"],
+            "conflict_info":{"nested":"x".repeat(20_000)}
+        });
+        let compact = summary_input_record(&record);
+        assert_eq!(compact["id"], "f1");
+        assert_eq!(compact["feedback_type"], "功能建议");
+        assert_eq!(compact["content"].as_str().unwrap().chars().count(), 1_500);
+        assert_eq!(
+            compact["developer_reply"].as_str().unwrap().chars().count(),
+            1_000
+        );
+        assert!(compact.get("images").is_none());
+        assert!(compact.get("conflict_info").is_none());
+    }
+
+    #[test]
+    fn transient_summary_errors_trigger_adaptation_only() {
         let error = anyhow::anyhow!("模型服务在 90 秒内未返回结果");
         assert!(model_error_can_fallback(&error));
+        assert!(model_error_can_fallback(&anyhow::anyhow!(
+            "408:request timeout"
+        )));
+        assert!(model_error_can_fallback(&anyhow::anyhow!(
+            "502:bad gateway"
+        )));
         assert!(!model_error_can_fallback(&anyhow::anyhow!(
             "401:invalid api key"
         )));
-        let summary = fallback_batch_summary(
-            "评论",
-            &[
-                json!({"id":"c1","resource_name":"组件","published_at":"2026-08-25T00:00:00Z","content":"进入世界后会闪退"}),
-            ],
-        );
-        assert!(summary.contains("需人工复核"));
-        assert!(summary.contains("进入世界后会闪退"));
-        assert!(summary.len() < 4_000);
     }
     #[test]
     fn public_feedback_tools_remain_read_only() {
