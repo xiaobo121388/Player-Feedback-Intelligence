@@ -983,27 +983,9 @@ impl AiEngine {
             return Ok("没有数据".into());
         }
         while summaries.len() > 1 {
+            let previous_len = summaries.len();
             let mut next = Vec::new();
-            let mut group = Vec::new();
-            let mut chars = 0usize;
-            for summary in summaries {
-                if !group.is_empty() && chars + summary.chars().count() > 20_000 {
-                    next.push(
-                        match self.reduce_group(config, kind, &group, cancel).await {
-                            Ok(summary) => summary,
-                            Err(error) if model_error_can_fallback(&error) => {
-                                fallback_reduce_group(kind, &group)
-                            }
-                            Err(error) => return Err(error),
-                        },
-                    );
-                    group.clear();
-                    chars = 0;
-                }
-                chars += summary.chars().count();
-                group.push(summary);
-            }
-            if !group.is_empty() {
+            for group in reduction_groups(summaries, 20_000) {
                 next.push(
                     match self.reduce_group(config, kind, &group, cancel).await {
                         Ok(summary) => summary,
@@ -1013,6 +995,13 @@ impl AiEngine {
                         Err(error) => return Err(error),
                     },
                 );
+            }
+            if next.len() >= previous_len {
+                eprintln!(
+                    "model summary reduction made no progress; collapsed {} groups locally",
+                    next.len()
+                );
+                return Ok(fallback_reduce_group(kind, &next));
             }
             summaries = next;
         }
@@ -1304,6 +1293,31 @@ fn fallback_reduce_group(kind: &str, group: &[String]) -> String {
     .to_string()
 }
 
+fn reduction_groups(summaries: Vec<String>, max_chars: usize) -> Vec<Vec<String>> {
+    debug_assert!(max_chars > 0);
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut current = Vec::new();
+    let mut chars = 0usize;
+    for summary in summaries {
+        let length = summary.chars().count();
+        if current.len() >= 2 && chars + length > max_chars {
+            groups.push(std::mem::take(&mut current));
+            chars = 0;
+        }
+        chars += length;
+        current.push(summary);
+    }
+    if current.len() == 1
+        && let Some(last) = groups.last_mut()
+    {
+        last.append(&mut current);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 fn compact_data_tool_messages(messages: &mut [Value]) {
     for message in messages {
         let is_data_result = message.get("role").and_then(Value::as_str) == Some("tool")
@@ -1555,6 +1569,30 @@ mod tests {
             "401:invalid api key"
         )));
     }
+
+    #[test]
+    fn reduction_groups_always_reduce_the_number_of_summaries() {
+        for count in 2..=9 {
+            let summaries = (0..count).map(|_| "摘".repeat(12_000)).collect();
+            let groups = reduction_groups(summaries, 20_000);
+            assert!(groups.len() < count);
+            assert!(groups.iter().all(|group| group.len() >= 2));
+            assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), count);
+        }
+    }
+
+    #[test]
+    fn reduction_groups_keep_small_summaries_within_the_soft_limit() {
+        let groups = reduction_groups(vec!["a".repeat(6_000); 6], 20_000);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [3, 3]);
+        assert!(
+            groups
+                .iter()
+                .all(|group| group.iter().map(|value| value.len()).sum::<usize>() <= 20_000)
+        );
+    }
+
     #[test]
     fn public_feedback_tools_remain_read_only() {
         let names: Vec<_> = tool_schemas(true, false)
